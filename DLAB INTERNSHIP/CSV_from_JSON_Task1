@@ -1,1 +1,228 @@
-# CODIGO PARA VOLCAR TODA LA INFO DE LA PERFORMANCE DE LA TASK 1 EN UN EXCEL
+# ATM26 — Task 1: Generador de Excel de performance
+# Dump JSON info into an organized CSV to recollect info from all metrics, training models and folds
+
+import json
+import os
+import re
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment
+
+# ------- COMMAND LINE ARGUMENTS ------------------------------------------------
+# Vamos a definir las rutas desde la terminal en vez de editar el codigo para cada ejecucion
+
+import argparse
+parser = argparse.ArgumentParser(description="Rutas para generar el CSV a partir de los JSONs con los summaries de cada entrenamiento y cada fold")
+
+parser.add_argument("ruta_JSON", help="Directorio donde encontramos la CARPETA con los summaries de cada entrenamiento y cada fold")
+parser.add_argument("ruta_CSV", help="Ruta al ARCHIVO CSV donde queremos compactar las métricas")
+
+args = parser.parse_args()
+
+# ── RUTAS ─────────────────────────────────────────────────────────────────────
+# Use the parsed command-line arguments
+JSON_FOLDER = args.ruta_JSON
+OUTPUT_XLSX = args.ruta_CSV
+
+# ── METRICAS A INCLUIR (en este orden en el Excel) ────────────────────────────
+METRICS = [
+    "Dice", "precision", "sensitivity", "clDice", "clPrecision", "clSensitivity",
+    "TLD", "BD_ratio", "total_branches", "detected_branches",
+    "betti_error", "b0_pred", "b0_label", "IoU", "specificity"
+]
+
+# ── NOMBRES DE ENTRENAMIENTO (para ordenar las filas) ─────────────────────────
+TRAINING_ORDER = [
+    "DICE_CE",
+    "SkRecall",
+    "DICE_CE_clCE",
+    "DICE_CE_clCE_ATM_loss"
+]
+
+# Nombre legible para cada training (el que aparecerá en la columna Modelo)
+TRAINING_LABELS = {
+    "DICE_CE":           "Dice + CE",
+    "SkRecall":          "Skeleton Recall",
+    "DICE_CE_clCE": "Dice + CE + clCE",
+    "DICE_CE_clCE_ATM_loss": "Dice + CE + clCE (ATM Loss)"
+}
+
+# ------------------------------------------------------------------------------
+
+def parse_filename(fname):
+    """Extrae fold y training name del nombre de archivo sin requerir extensión."""
+    match = re.match(r"Fold_(\d+)_Summary_completo_(.+)$", fname)
+    if match:
+        fold = int(match.group(1))
+        training_raw = match.group(2)
+        # strip extension if present
+        training_no_ext = os.path.splitext(training_raw)[0]
+
+        # normalize helper: lower, remove extra underscores differences and map FO variants
+        def norm(s):
+            s2 = s.lower()
+            s2 = s2.replace("fo_090", "fo90").replace("fo_09", "fo90")
+            s2 = s2.replace("fo_075", "fo75").replace("fo_75", "fo75")
+            s2 = s2.replace("-", "_")
+            s2 = re.sub(r"_+", "_", s2)
+            return s2
+
+        target_norm = norm(training_no_ext)
+
+        # try to find a matching key from TRAINING_ORDER or TRAINING_LABELS preserving original key casing
+        candidates = list(TRAINING_ORDER) + list(TRAINING_LABELS.keys())
+        for cand in candidates:
+            if norm(cand) == target_norm:
+                return fold, cand
+
+        # fallback: return the name without extension as-is
+        return fold, training_no_ext
+    return None, None
+
+def load_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+# ------------------------------------------------------------------------------
+# 1. Escanear carpeta, cargar todos los JSON validos y buscar las means y stdv
+# ------------------------------------------------------------------------------
+data_rows = [] 
+print("--- INICIANDO ESCANEO DE CARPETA ---")
+
+for fname in os.listdir(JSON_FOLDER):
+    print(f"Encontrado: '{fname}'")
+    
+    # Filtramos por los que empiecen por "Fold_" en lugar de la extensión
+    if not fname.startswith("Fold_"):
+        print("   -> Descartado: No empieza por 'Fold_'")
+        continue
+        
+    fold, training = parse_filename(fname)
+    
+    if fold is None:
+        print("   -> Descartado: El nombre no coincide con el regex") 
+        continue
+        
+    path = os.path.join(JSON_FOLDER, fname)
+    
+    # Aunque no tenga extensión, esto lo cargará correctamente como JSON
+    data = load_json(path)
+    means = data["mean"]["1"]
+    stds  = data["std"]["1"]
+    
+    data_rows.append({
+        "fold": fold,
+        "training": training,
+        "means": means,
+        "stds": stds
+    })
+    print("   -> AÑADIDO CON ÉXITO")
+
+print("--- FIN DEL ESCANEO ---")
+
+# ------------------------------------------------------------------------------
+# 2. Ordenar: primero por fold, luego por orden de training
+# ------------------------------------------------------------------------------
+def sort_key(row):
+    fold_order = row["fold"]
+    try:
+        training_order = TRAINING_ORDER.index(row["training"])
+    except ValueError:
+        training_order = 999  # trainings no listados van al final
+    return (fold_order, training_order)
+
+data_rows.sort(key=sort_key)
+
+# ------------------------------------------------------------------------------
+# 3. Crear Excel y aplicar formato visual
+# ------------------------------------------------------------------------------
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = "Performance Summary"
+
+# --- Definición de Estilos (Fuentes y Alineación) ---
+bold_font = Font(bold=True)
+center_align = Alignment(horizontal="center", vertical="center")
+
+# --- Asignación de colores por Modelo ---
+fill_modelos = {
+    "DICE_CE":           PatternFill(start_color="FEEBE6", end_color="FEEBE6", fill_type="solid"),
+    "SkRecall":          PatternFill(start_color="FDC6BA", end_color="FDC6BA", fill_type="solid"),
+    "DICE_CE_clCE":      PatternFill(start_color="D94A2C", end_color="D94A2C", fill_type="solid"),
+    "DICE_CE_clCE_ATM_loss": PatternFill(start_color="A0A0A0", end_color="A0A0A0", fill_type="solid")
+}
+
+# --- Colores dinámicos para la columna Fold (tenemos 5 folds en total) ---
+fold_fills = [
+    PatternFill(start_color="E4DDC8", end_color="E4DDC8", fill_type="solid"), 
+    PatternFill(start_color="D2C6A6", end_color="D2C6A6", fill_type="solid"), 
+    PatternFill(start_color="9D9471", end_color="9D9471", fill_type="solid"), 
+    PatternFill(start_color="E2E0D1", end_color="E2E0D1", fill_type="solid"), 
+    PatternFill(start_color="CEC8AB", end_color="CEC8AB", fill_type="solid")  
+]
+
+# --- Escribir y formatear Cabeceras ---
+ws["A1"] = "Fold"
+ws["A1"].font = bold_font
+ws["A1"].alignment = center_align
+
+ws["B1"] = "Modelo"
+ws["B1"].font = bold_font
+ws["B1"].alignment = center_align
+
+col = 3  # Empieza en columna C
+for metric in METRICS:
+    c_mean = ws.cell(row=1, column=col, value=f"{metric} mean")
+    c_mean.font = bold_font
+    c_mean.alignment = center_align
+    
+    c_std = ws.cell(row=1, column=col+1, value=f"{metric} std")
+    c_std.font = bold_font
+    c_std.alignment = center_align
+    col += 2
+
+# Ajustar ancho de columnas
+ws.column_dimensions["A"].width = 8
+ws.column_dimensions["B"].width = 50
+for i in range(3, col):
+    ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 16
+
+# --- Rellenar Datos y aplicar estilos por fila ---
+row_idx = 2
+
+for entry in data_rows:
+    current_fold = entry["fold"]
+    label = TRAINING_LABELS.get(entry["training"], entry["training"])
+
+    # 1. Celda del Fold (Columna A)
+    c_fold = ws.cell(row=row_idx, column=1, value=entry["fold"])
+    c_fold.alignment = center_align
+    c_fold.font = bold_font 
+    c_fold.fill = fold_fills[current_fold % len(fold_fills)]
+    
+    # 2. Asignar el color correspondiente a la fila según el modelo
+    fila_fill = fill_modelos.get(entry["training"], PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid"))
+    
+    c_modelo = ws.cell(row=row_idx, column=2, value=label)
+    c_modelo.fill = fila_fill
+    c_modelo.alignment = center_align
+
+    col = 3
+    for metric in METRICS:
+        mean_val = entry["means"].get(metric, "")
+        std_val  = entry["stds"].get(metric, "")
+        
+        c_mean = ws.cell(row=row_idx, column=col, value=round(mean_val, 6) if isinstance(mean_val, float) else mean_val)
+        c_mean.fill = fila_fill
+        c_mean.alignment = center_align
+        
+        c_std = ws.cell(row=row_idx, column=col+1, value=round(std_val,  6) if isinstance(std_val,  float) else std_val)
+        c_std.fill = fila_fill
+        c_std.alignment = center_align
+        col += 2
+
+    row_idx += 1
+
+# Guardar documento
+wb.save(OUTPUT_XLSX)
+print(f"\nExcel finalizado y guardado en: {OUTPUT_XLSX}")
+print(f"Casos totales procesados: {len(data_rows)}")
