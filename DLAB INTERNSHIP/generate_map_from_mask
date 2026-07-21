@@ -1,1 +1,65 @@
-# CODE PARA GENERAR UNA MÁSCARA DE TP, FP, FN A PARTIR DE UNA MASCARA DE UAN PREDICCION BINARIA Y UNA MASCARA DE GROUND TRUTH
+# CREAR MAPAS CON LOS TRUE POSITIVES, FALSE POSITIVES Y FALSE NEGATIVES A PARTIR DE LAS MÁSCARAS DE GT Y PREDICCIÓN
+
+# ── 1. Instalar dependencias ──────────────────────────────────
+import SimpleITK as sitk
+import numpy as np
+import os
+
+# -------------------------------------------------------------------------------
+# "argparser" para ejecutar el codigo desde la linea de comandos sin tener que entrar y modificar las rutas dentro del archivo
+# Nosotros necesitamos 3 argumentos (3 rutas): 1) al GT, 2) a las predicciones, 3) a la ruta donde guardar el mapa
+import argparse
+
+parser = argparse.ArgumentParser(description="Rutas para generar el mapa de True Positives, False POsitives y False Negatives a partir de las máscaras de GT y predicción")
+parser.add_argument("ruta_GT", help="Directorio donde encontramos la CARPETA con las mascaras de la GT del entrenamiento que queremos analizar")
+parser.add_argument("ruta_pred", help="Directorio donde encontramos la CARPETA con las máscara de las predicciones del entrenamiento que queremos analizar")
+parser.add_argument("ruta_mapa", help="Ruta a la CARPETA donde queremos guardar los mapas de análisis")
+parser.add_argument("nombre_training", help="Nombre del entrenamiento que queremos analizar (ej: 'training_1')")
+
+args = parser.parse_args()
+
+
+# Definimos los casos que queremos analizar, en este caso seran 3
+list_of_cases = ["ATM_153", "ATM_192", "ATM_507"]
+
+for case in list_of_cases:
+    GT_PATH = os.path.join(args.ruta_GT, case + ".mha")
+    PRED_PATH = os.path.join(args.ruta_pred, case + ".mha")
+    OUT_PATH = os.path.join(args.ruta_mapa, args.nombre_training + "_" + case + "_mapa.mha")
+
+    # ── 3. Cargar imágenes ────────────────────────────────────────
+    gt_img   = sitk.ReadImage(GT_PATH)
+    pred_img = sitk.ReadImage(PRED_PATH)
+
+    gt_arr   = sitk.GetArrayFromImage(gt_img).astype(np.uint8)
+    pred_arr = sitk.GetArrayFromImage(pred_img).astype(np.uint8)
+
+    # Binarizar por si los valores no son exactamente 0/1
+    gt_arr   = (gt_arr   > 0).astype(np.uint8)
+    pred_arr = (pred_arr > 0).astype(np.uint8)
+
+    print(f"GT shape   : {gt_arr.shape}")
+    print(f"Pred shape : {pred_arr.shape}")
+    assert gt_arr.shape == pred_arr.shape, "Las máscaras no tienen el mismo tamaño."
+
+    # ── 4. Calcular TP / FP / FN ─────────────────────────────────
+    TP = (pred_arr == 1) & (gt_arr == 1)
+    FP = (pred_arr == 1) & (gt_arr == 0)
+    FN = (pred_arr == 0) & (gt_arr == 1)
+
+    # ── 5. Construir máscara de análisis ──────────────────────────
+    #   0 = TN  (fondo, transparente en ITK-SNAP)
+    #   1 = TP  (verde)
+    #   2 = FP  (rojo)
+    #   3 = FN  (azul)
+    analysis = np.zeros_like(gt_arr, dtype=np.uint8)
+    analysis[TP] = 1
+    analysis[FP] = 2
+    analysis[FN] = 3
+
+    # ── 6. Guardar conservando metadatos del espacio (spacing, origin, direction) ─
+    analysis_img = sitk.GetImageFromArray(analysis)
+    analysis_img.CopyInformation(gt_img)   # copia spacing / origin / direction
+    sitk.WriteImage(analysis_img, OUT_PATH)
+
+    print(f"\n Guardado en: {OUT_PATH}")
