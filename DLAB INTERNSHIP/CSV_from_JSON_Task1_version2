@@ -1,0 +1,246 @@
+# ATM26 — Task 1: Generador de Excel de performance
+# Vuelca la info de UN summary JSON (un fold de un entrenamiento) como una fila
+# Se ejecuta una vez por fold y entrenamiento
+
+import json
+import os
+import re
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
+# ── CONFIGURACIÓN GENERAL ────────────────────────────────────────────────────────────
+N_TRAININGS = 9   # nº de entrenamientos 
+
+# ------- COMMAND LINE ARGUMENTS ------------------------------------------------
+# El fold se deduce del nombre del fichero (hardcoding). 
+# El nombre y el nº de orden del modelo los decide el usuario y se pasan por la terminal
+
+import argparse
+parser = argparse.ArgumentParser(
+    description="Añade a un Excel una fila con las métricas de un summary JSON "
+                "(un fold de un entrenamiento) y mantiene el archivo ordenado."
+)
+
+parser.add_argument("ruta_JSON",
+                    help="Ruta al ARCHIVO JSON con el summary de un fold de un entrenamiento "
+                         "(p.ej. Fold_0_Summary_completo_DICE_CE)")
+parser.add_argument("ruta_CSV",
+                    help="Ruta al ARCHIVO Excel de salida (se crea si no existe, se amplía si ya existe)")
+parser.add_argument("nombre_modelo",
+                    help="Texto libre para la columna 'Modelo' (lo que quieras que aparezca en la celda)")
+parser.add_argument("orden", type=int, choices=range(1, N_TRAININGS + 1),
+                    help=f"Posición del entrenamiento (1..{N_TRAININGS})")
+
+args = parser.parse_args()
+
+# ── ARGS ──────────────────────────────────────────────────────────────────────
+JSON_FILE   = args.ruta_JSON
+OUTPUT_XLSX = args.ruta_CSV
+MODEL_NAME  = args.nombre_modelo
+ORDER       = args.orden
+
+# ── METRICAS A INCLUIR (en este orden en el Excel) ────────────────────────────
+METRICS = [
+    "Dice", "precision", "sensitivity", "clDice", "clPrecision", "clSensitivity",
+    "TLD", "BD_ratio", "total_branches", "detected_branches",
+    "betti_error", "b0_pred", "b0_label", "IoU", "specificity"
+]
+
+# ── COLORES POR FOLD (hardcoded, tenemos 5 folds en total) ────────────────────
+fold_fills = [
+    PatternFill(start_color="E4DDC8", end_color="E4DDC8", fill_type="solid"),
+    PatternFill(start_color="D2C6A6", end_color="D2C6A6", fill_type="solid"),
+    PatternFill(start_color="9D9471", end_color="9D9471", fill_type="solid"),
+    PatternFill(start_color="E2E0D1", end_color="E2E0D1", fill_type="solid"),
+    PatternFill(start_color="CEC8AB", end_color="CEC8AB", fill_type="solid")
+]
+
+# ── COLOR POR MODELO (degradado SALMÓN pastel, indexado por 'orden') ──────────
+# Trabajamos en HSL con tono y saturación FIJOS (para que siempre sea salmón,
+# no gris/verdoso) y solo variamos la luminosidad: 'orden'=1 el más claro,
+# 'orden'=N el más oscuro.
+import colorsys
+SALMON_HUE   = 12 / 360   # tono salmón (naranja-rojizo)
+SALMON_SAT   = 0.68       # saturación (pastel pero con color)
+LIGHT_TOP    = 0.90       # luminosidad del más claro (orden 1)
+LIGHT_BOTTOM = 0.62       # luminosidad del más oscuro (orden N)
+
+def model_color(order):
+    """Color hex salmón según el nº de orden (1..N_TRAININGS)."""
+    n = max(1, N_TRAININGS - 1)                       # evita división por cero
+    t = (order - 1) / n                               # 0.0 (claro) .. 1.0 (oscuro)
+    light = LIGHT_TOP - (LIGHT_TOP - LIGHT_BOTTOM) * t
+    r, g, b = colorsys.hls_to_rgb(SALMON_HUE, light, SALMON_SAT)
+    return f"{round(r * 255):02X}{round(g * 255):02X}{round(b * 255):02X}"
+
+# ------------------------------------------------------------------------------
+
+def parse_fold(path):
+    """Extrae el número de fold del nombre del fichero (Fold_<n>_...)."""
+    fname = os.path.basename(path)
+    match = re.match(r"Fold_(\d+)", fname)
+    return int(match.group(1)) if match else None
+
+def load_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+# ------------------------------------------------------------------------------
+# 1. Leer el JSON de este (fold, entrenamiento)
+# ------------------------------------------------------------------------------
+fold = parse_fold(JSON_FILE)
+if fold is None:
+    raise SystemExit(
+        f"ERROR: el nombre '{os.path.basename(JSON_FILE)}' no empieza por 'Fold_<n>'; "
+        "no puedo determinar el fold."
+    )
+
+data  = load_json(JSON_FILE)
+means = data["mean"]["1"]
+stds  = data["std"]["1"]
+
+print(f"--- Fold {fold} | Orden {ORDER} | Modelo: '{MODEL_NAME}' ---")
+
+# ------------------------------------------------------------------------------
+# 2. Leer filas ya existentes en el Excel (si lo hay)
+#    Columnas: A=Fold, B=Orden, C=Modelo, D..=métricas (mean/std)
+# ------------------------------------------------------------------------------
+def read_existing_rows(ws):
+    rows = []
+    for r in range(2, ws.max_row + 1):
+        fold_v  = ws.cell(row=r, column=1).value
+        order_v = ws.cell(row=r, column=2).value
+        model_v = ws.cell(row=r, column=3).value
+        if fold_v is None and model_v is None:
+            continue
+        m, s = {}, {}
+        col = 4
+        for metric in METRICS:
+            m[metric] = ws.cell(row=r, column=col).value
+            s[metric] = ws.cell(row=r, column=col + 1).value
+            col += 2
+        rows.append({"fold": fold_v, "order": order_v, "model": model_v, "means": m, "stds": s})
+    return rows
+
+if os.path.exists(OUTPUT_XLSX):
+    wb_old = openpyxl.load_workbook(OUTPUT_XLSX)
+    rows = read_existing_rows(wb_old.active)
+    print(f"   -> Excel existente cargado ({len(rows)} filas de datos).")
+else:
+    rows = []
+    print("   -> No existía; se crea uno nuevo.")
+
+# ------------------------------------------------------------------------------
+# 3. Upsert: quitar la fila previa de este (fold, orden) y añadir la nueva
+# ------------------------------------------------------------------------------
+before = len(rows)
+rows = [row for row in rows if not (row["fold"] == fold and row["order"] == ORDER)]
+if len(rows) < before:
+    print(f"   -> Fila (fold={fold}, orden={ORDER}) ya existía; se sobrescribe.")
+
+rows.append({"fold": fold, "order": ORDER, "model": MODEL_NAME, "means": means, "stds": stds})
+
+# ------------------------------------------------------------------------------
+# 4. Ordenar: primero por fold, luego por 'orden'
+# ------------------------------------------------------------------------------
+def sort_key(row):
+    fold_v  = row["fold"]  if isinstance(row["fold"], int)  else 999
+    order_v = row["order"] if isinstance(row["order"], int) else 999
+    return (fold_v, order_v)
+
+rows.sort(key=sort_key)
+
+# ------------------------------------------------------------------------------
+# 5. Regenerar el Excel entero (cabeceras + filas ordenadas y estilizadas)
+# ------------------------------------------------------------------------------
+bold_font    = Font(bold=True)
+center_align = Alignment(horizontal="center", vertical="center")
+
+def write_headers(ws):
+    ws["A1"] = "Fold"
+    ws["B1"] = "Orden"
+    ws["C1"] = "Modelo"
+    for cell_ref in ("A1", "B1", "C1"):
+        ws[cell_ref].font = bold_font
+        ws[cell_ref].alignment = center_align
+
+    col = 4  # Las métricas empiezan en la columna D
+    for metric in METRICS:
+        c_mean = ws.cell(row=1, column=col, value=f"{metric} mean")
+        c_mean.font = bold_font
+        c_mean.alignment = center_align
+
+        c_std = ws.cell(row=1, column=col + 1, value=f"{metric} std")
+        c_std.font = bold_font
+        c_std.alignment = center_align
+        col += 2
+
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 8
+    ws.column_dimensions["B"].hidden = True   # 'Orden' es interna: se oculta
+    ws.column_dimensions["C"].width = 50
+    for i in range(4, 4 + 2 * len(METRICS)):
+        ws.column_dimensions[get_column_letter(i)].width = 16
+
+def write_data_row(ws, r, row):
+    fold_v  = row["fold"]
+    order_v = row["order"]
+    model_v = row["model"]
+
+    fill = None
+    if isinstance(order_v, int):
+        hexc = model_color(order_v)
+        fill = PatternFill(start_color=hexc, end_color=hexc, fill_type="solid")
+
+    # Columna A: Fold
+    c_fold = ws.cell(row=r, column=1, value=fold_v)
+    c_fold.alignment = center_align
+    c_fold.font = bold_font
+    if isinstance(fold_v, int):
+        c_fold.fill = fold_fills[fold_v % len(fold_fills)]
+
+    # Columna B: Orden
+    c_ord = ws.cell(row=r, column=2, value=order_v)
+    c_ord.alignment = center_align
+    if fill:
+        c_ord.fill = fill
+
+    # Columna C: Modelo
+    c_modelo = ws.cell(row=r, column=3, value=model_v)
+    c_modelo.alignment = center_align
+    if fill:
+        c_modelo.fill = fill
+
+    # Columnas D..: métricas (mean/std)
+    col = 4
+    for metric in METRICS:
+        mean_val = row["means"].get(metric, "")
+        std_val  = row["stds"].get(metric, "")
+
+        c_mean = ws.cell(row=r, column=col,
+                         value=round(mean_val, 6) if isinstance(mean_val, float) else mean_val)
+        c_mean.alignment = center_align
+        if fill:
+            c_mean.fill = fill
+
+        c_std = ws.cell(row=r, column=col + 1,
+                        value=round(std_val, 6) if isinstance(std_val, float) else std_val)
+        c_std.alignment = center_align
+        if fill:
+            c_std.fill = fill
+        col += 2
+
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = "Performance Summary"
+write_headers(ws)
+
+row_idx = 2
+for row in rows:
+    write_data_row(ws, row_idx, row)
+    row_idx += 1
+
+wb.save(OUTPUT_XLSX)
+print(f"\nExcel guardado y ordenado en: {OUTPUT_XLSX}")
+print(f"Total de filas de datos ahora: {len(rows)}")
