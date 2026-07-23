@@ -1,0 +1,216 @@
+ruta_base = ""
+
+# SEGMENTACION DE LOBULOS CON TOTAL SEGMENTATOR
+import os
+import glob
+import SimpleITK as sitk
+import nibabel as nib
+from totalsegmentator.python_api import totalsegmentator
+
+# 1. Rutas exactas
+base_path = '/content/drive/MyDrive/ENGINYERIA BIOMÈDICA UB/TERCER CURS/SEGON SEMESTRE/_ PRÀCTIQUES EN EMPRESA/DLab - SANT PAU/Research/ATMs/ATM 2026/Proyecto_ATM26'
+img_dir = os.path.join(base_path, 'images')
+drive_out_dir = os.path.join(base_path, 'Outputs_TotalSeg')
+os.makedirs(drive_out_dir, exist_ok=True)
+
+imagenes = glob.glob(os.path.join(img_dir, '*.mha'))
+print(f"Se han encontrado {len(imagenes)} imágenes para procesar.")
+
+lobulos_list = [
+    "lung_upper_lobe_left", "lung_lower_lobe_left",
+    "lung_upper_lobe_right", "lung_middle_lobe_right", "lung_lower_lobe_right"
+]
+
+# Función para reducir el tamaño de la matriz y no colapsar la RAM
+def reducir_resolucion(img_sitk, nuevo_espaciado=(3.0, 3.0, 3.0)):
+    espaciado_orig = img_sitk.GetSpacing()
+    tamano_orig = img_sitk.GetSize()
+
+    nuevo_tamano = [
+        int(round(tamano_orig[0] * (espaciado_orig[0] / nuevo_espaciado[0]))),
+        int(round(tamano_orig[1] * (espaciado_orig[1] / nuevo_espaciado[1]))),
+        int(round(tamano_orig[2] * (espaciado_orig[2] / nuevo_espaciado[2])))
+    ]
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetSize(nuevo_tamano)
+    resampler.SetOutputSpacing(nuevo_espaciado)
+    resampler.SetOutputOrigin(img_sitk.GetOrigin())
+    resampler.SetOutputDirection(img_sitk.GetDirection())
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(img_sitk.GetPixelIDValue())
+
+    return resampler.Execute(img_sitk)
+
+for img_path in imagenes:
+    nombre_caso = os.path.basename(img_path).replace('.mha', '')
+    print(f"\n--- Procesando {nombre_caso} (Modo Anti-OOM) ---")
+
+    temp_nii = f"/content/{nombre_caso}_temp.nii"
+    temp_mask_nii = f"/content/{nombre_caso}_mask_temp.nii"
+
+    try:
+        # 1. Leemos el volumen CT pesado
+        img_sitk_original = sitk.ReadImage(img_path)
+
+        # 2. Lo comprimimos a baja resolución (aprox 3mm)
+        print("-> Comprimiendo matriz para evitar límite de RAM...")
+        img_pequena = reducir_resolucion(img_sitk_original)
+        sitk.WriteImage(img_pequena, temp_nii)
+
+        # 3. Segmentamos (TotalSegmentator procesa la matriz pequeña sin enterarse)
+        print("-> Segmentando lóbulos...")
+        seg_nib = totalsegmentator(temp_nii, roi_subset=lobulos_list, fast=True, ml=True)
+        nib.save(seg_nib, temp_mask_nii)
+
+        # 4. Leemos la máscara y la "ESTIRAMOS" copiando el espacio físico original
+        print("-> Restaurando dimensiones exactas originales...")
+        mask_pequena_sitk = sitk.ReadImage(temp_mask_nii)
+
+        resampler_final = sitk.ResampleImageFilter()
+        # El truco clave: copiar la geometría exacta del .mha pesado
+        resampler_final.SetReferenceImage(img_sitk_original)
+        resampler_final.SetInterpolator(sitk.sitkNearestNeighbor)
+        resampler_final.SetDefaultPixelValue(0)
+
+        mask_final_sitk = resampler_final.Execute(mask_pequena_sitk)
+
+        # 5. Guardamos en Drive
+        out_file_path = os.path.join(drive_out_dir, f"{nombre_caso}_lobulos.nii")
+        sitk.WriteImage(mask_final_sitk, out_file_path)
+        print(f"✅ ¡Éxito! Guardado en: {out_file_path}")
+
+    except Exception as e:
+        print(f"❌ Error en {nombre_caso}: {e}")
+
+    finally:
+        # Borramos los temporales para mantener la unidad limpia
+        if os.path.exists(temp_nii): os.remove(temp_nii)
+        if os.path.exists(temp_mask_nii): os.remove(temp_mask_nii)
+
+print("\n¡Proceso finalizado!")
+
+import os
+import glob
+import SimpleITK as sitk
+import numpy as np
+import pandas as pd
+
+# 1. Rutas del proyecto (usando tu path exacto)
+base_path = '/content/drive/MyDrive/ENGINYERIA BIOMÈDICA UB/TERCER CURS/SEGON SEMESTRE/_ PRÀCTIQUES EN EMPRESA/DLab - SANT PAU/Research/ATMs/ATM 2026/Proyecto_ATM26'
+multitask_dir = os.path.join(base_path, 'labelsTr_MULTITASK')
+lobulos_dir = os.path.join(base_path, 'Outputs_TotalSeg')
+
+# 2. Mapeo de los IDs reales de TotalSegmentator a nombres anatómicos
+mapa_lobulos = {
+    0: "Fuera de los pulmones",
+    10: "Lóbulo Superior Izquierdo",
+    11: "Lóbulo Inferior Izquierdo",
+    12: "Lóbulo Superior Derecho",
+    13: "Lóbulo Medio Derecho",
+    14: "Lóbulo Inferior Derecho"
+}
+
+resultados_experimento = []
+
+# 3. Buscamos los archivos de la carpeta MULTITASK
+archivos_labels = glob.glob(os.path.join(multitask_dir, '*.mha'))
+print(f"Iniciando análisis sobre {len(archivos_labels)} casos...\n")
+
+for label_path in archivos_labels:
+    nombre_caso = os.path.basename(label_path).replace('.mha', '')
+    print(f"Analizando: {nombre_caso}")
+
+    aparece_label_20 = "No"
+    lobulo_predominante = "N/A"
+    porcentaje_en_lobulo = 0.0
+    vóxeles_totales_20 = 0
+
+    # Comprobación de nombres (con y sin _0000)
+    lobulo_path = os.path.join(lobulos_dir, f"{nombre_caso}_lobulos.nii")
+    lobulo_path_con_sufijo = os.path.join(lobulos_dir, f"{nombre_caso}_0000_lobulos.nii")
+
+    ruta_final_lobulo = None
+    if os.path.exists(lobulo_path):
+        ruta_final_lobulo = lobulo_path
+    elif os.path.exists(lobulo_path_con_sufijo):
+        ruta_final_lobulo = lobulo_path_con_sufijo
+
+    if ruta_final_lobulo is None:
+        print(f"⚠️ Alerta: No se encontró la segmentación de lóbulos para {nombre_caso}. Saltando caso.")
+        continue
+
+    # 4. Cargamos los volúmenes con SimpleITK
+    sitk_multitask = sitk.ReadImage(label_path)
+    sitk_lobulos = sitk.ReadImage(ruta_final_lobulo)
+
+    arr_multitask = sitk.GetArrayFromImage(sitk_multitask)
+    arr_lobulos = sitk.GetArrayFromImage(sitk_lobulos)
+
+    # 5. Buscamos la label 20
+    mask_label_20 = (arr_multitask == 20)
+    vóxeles_totales_20 = np.sum(mask_label_20)
+
+    if vóxeles_totales_20 > 0:
+        aparece_label_20 = "Sí"
+
+        valores_lobulos_coincidentes = arr_lobulos[mask_label_20]
+
+        # Usamos bincount sin límite superior para capturar IDs altos de TotalSegmentator
+        conteos = np.bincount(valores_lobulos_coincidentes)
+
+        # Encontramos cuál es el lóbulo con más vóxeles (la moda)
+        id_lobulo_moda = np.argmax(conteos)
+
+        # MODIFICACIÓN CLAVE: Si no está en el diccionario del 1 al 5, nos muestra el ID real
+        lobulo_predominante = mapa_lobulos.get(id_lobulo_moda, f"ID {id_lobulo_moda} (Desconocido)")
+
+        porcentaje_en_lobulo = (conteos[id_lobulo_moda] / vóxeles_totales_20) * 100
+        print(f"   -> Label 20 DETECTADA ({vóxeles_totales_20} vóxeles). Ubicación principal: {lobulo_predominante} ({porcentaje_en_lobulo:.1f}%)")
+    else:
+        print("   -> Label 20 NO aparece en este caso.")
+
+    resultados_experimento.append({
+        "Caso": nombre_caso,
+        "Aparece Label 20": aparece_label_20,
+        "Lóbulo Predominante": lobulo_predominante,
+        "Porcentaje en Lóbulo": round(porcentaje_en_lobulo, 2),
+        "Vóxeles Totales Label 20": int(vóxeles_totales_20)
+    })
+
+# 6. Convertimos a DataFrame y exportamos
+df_resultados = pd.DataFrame(resultados_experimento)
+excel_output_path = os.path.join(base_path, 'Analisis_Label20_ATM26.xlsx')
+df_resultados.to_excel(excel_output_path, index=False)
+
+print(f"\n¡Experimento completado con éxito!")
+print(f"Se ha guardado el Excel en:\n--> {excel_output_path}")
+
+display(df_resultados)
+
+# 6. Convertimos a DataFrame la lista principal
+df_resultados = pd.DataFrame(resultados_experimento)
+
+# --- NUEVA SECCIÓN: Creación de la tabla resumen ---
+# 7. Filtramos solo los casos donde la label 20 SÍ aparece
+df_positivos = df_resultados[df_resultados["Aparece Label 20"] == "Sí"]
+
+# Contamos la frecuencia de cada lóbulo predominante
+df_resumen = df_positivos["Lóbulo Predominante"].value_counts().reset_index()
+# Renombramos las columnas para que quede bonito
+df_resumen.columns = ["Lóbulo", "Frecuencia (Nº de Casos)"]
+# ---------------------------------------------------
+
+# 8. Exportamos ambas tablas a un único archivo Excel con dos pestañas
+excel_output_path = os.path.join(base_path, 'Analisis_Label20_ATM26.xlsx')
+
+# Usamos ExcelWriter para guardar múltiples hojas
+with pd.ExcelWriter(excel_output_path, engine='openpyxl') as writer:
+    df_resultados.to_excel(writer, sheet_name='Detalle por Caso', index=False)
+    df_resumen.to_excel(writer, sheet_name='Resumen Lóbulos', index=False)
+
+print(f"\n¡Experimento completado con éxito!")
+print(f"Se ha guardado el Excel con DOS pestañas en:\n--> {excel_output_path}")
+
+print("\n--- TABLA RESUMEN ---")
+display(df_resumen)
